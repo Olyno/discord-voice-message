@@ -3,146 +3,316 @@ package main
 import (
 	"errors"
 	"fmt"
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/widget"
 	"io/fs"
-	"log"
 	"os"
 	"strconv"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-var token []byte
+const tokenFile = "token"
 
-func init() {
-	var err error
-	token, err = os.ReadFile("token")
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			_, err := os.Create("token")
-			if err != nil {
-				log.Fatalln(err)
-			}
-		} else {
-			log.Fatalln("Couldn't read token:", err)
-		}
+var (
+	focusStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+	labelStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	successStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	hintStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	checkboxOn      = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Render("[x]")
+	checkboxOff     = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("[ ]")
+)
+
+type model struct {
+	inputs []textinput.Model
+	focus  int
+	isDM   bool
+	status string
+	err    string
+}
+
+const (
+	fieldToken = iota
+	fieldChannel
+	fieldAudio
+	fieldTimes
+)
+
+func initialModel() model {
+	token := textinput.New()
+	token.Placeholder = "Enter Discord token"
+	token.EchoMode = textinput.EchoPassword
+	token.EchoCharacter = '•'
+	token.Width = 40
+	token.Focus()
+
+	channel := textinput.New()
+	channel.Placeholder = "Enter channel ID"
+	channel.Width = 40
+
+	audio := textinput.New()
+	audio.Placeholder = "Enter audio file path"
+	audio.Width = 40
+
+	times := textinput.New()
+	times.Placeholder = "Number of times to send"
+	times.SetValue("1")
+	times.Width = 40
+
+	return model{
+		inputs: []textinput.Model{token, channel, audio, times},
+		focus:  fieldToken,
+		status: "Ready",
 	}
 }
 
-func main() {
+func (m model) Init() tea.Cmd {
+	return textinput.Blink
+}
 
-	a := app.NewWithID("discord-voice-message")
-	w := a.NewWindow("Discord Voice Message")
-	w.Resize(fyne.NewSize(600, 400))
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 
-	// Create the widgets
-	channelEntry := widget.NewEntry()
-	channelEntry.SetPlaceHolder("Enter channel ID")
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
+			return m, tea.Quit
+		case tea.KeyTab:
+			m.nextFocus()
+		case tea.KeyShiftTab:
+			m.prevFocus()
+		case tea.KeyEnter:
+			return m.handleSubmit()
+		case tea.KeyCtrlS:
+			return m.saveToken()
+		case tea.KeyCtrlD:
+			m.toggleDM()
+		case tea.KeyCtrlR:
+			m.clearStatus()
+		default:
+			m.inputs[m.focus], cmd = m.inputs[m.focus].Update(msg)
+		}
+	default:
+		m.inputs[m.focus], cmd = m.inputs[m.focus].Update(msg)
+	}
 
-	tokenEntry := widget.NewPasswordEntry()
-	saveTkn := widget.NewButton("Save", func() {
-		err := os.WriteFile("token", []byte(tokenEntry.Text), 0755)
+	return m, cmd
+}
+
+func (m *model) nextFocus() {
+	m.inputs[m.focus].Blur()
+	m.focus = (m.focus + 1) % len(m.inputs)
+	m.inputs[m.focus].Focus()
+}
+
+func (m *model) prevFocus() {
+	m.inputs[m.focus].Blur()
+	m.focus--
+	if m.focus < 0 {
+		m.focus = len(m.inputs) - 1
+	}
+	m.inputs[m.focus].Focus()
+}
+
+func (m *model) toggleDM() {
+	m.isDM = !m.isDM
+	if m.isDM {
+		m.inputs[fieldChannel].Placeholder = "Enter user ID"
+	} else {
+		m.inputs[fieldChannel].Placeholder = "Enter channel ID"
+	}
+	if m.isDM {
+		m.status = "DM mode enabled"
+	} else {
+		m.status = "DM mode disabled"
+	}
+}
+
+func (m *model) clearStatus() {
+	m.status = "Ready"
+	m.err = ""
+}
+
+// sanitizeID removes any non-digit characters from a Discord ID.
+// This lets users paste IDs copied from mentions such as <@123456789> or <#123456789>.
+func sanitizeID(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (m model) handleSubmit() (tea.Model, tea.Cmd) {
+	switch m.focus {
+	case fieldToken:
+		return m.saveToken()
+	default:
+		return m.send()
+	}
+}
+
+func (m model) saveToken() (tea.Model, tea.Cmd) {
+	token := m.inputs[fieldToken].Value()
+	if token == "" {
+		m.err = "token cannot be empty"
+		m.status = ""
+		return m, nil
+	}
+
+	if err := os.WriteFile(tokenFile, []byte(token), 0600); err != nil {
+		m.err = fmt.Sprintf("could not save token: %s", err)
+		m.status = ""
+		return m, nil
+	}
+
+	m.inputs[fieldToken].SetValue("")
+	m.status = "Token saved securely"
+	m.err = ""
+	return m, nil
+}
+
+func (m model) send() (tea.Model, tea.Cmd) {
+	// Resolve token from the input field or from the saved file.
+	token := m.inputs[fieldToken].Value()
+	if token == "" {
+		if _, err := os.Stat(tokenFile); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				m.err = "please enter and save a Discord token (Ctrl+S)"
+			} else {
+				m.err = fmt.Sprintf("could not check saved token: %s", err)
+			}
+			m.status = ""
+			return m, nil
+		}
+
+		data, err := os.ReadFile(tokenFile)
 		if err != nil {
-			dialog.ShowError(err, w)
+			m.err = fmt.Sprintf("could not read saved token: %s", err)
+			m.status = ""
+			return m, nil
+		}
+		token = string(data)
+	}
+
+	if token == "" {
+		m.err = "Discord token is empty"
+		m.status = ""
+		return m, nil
+	}
+
+	channel := sanitizeID(m.inputs[fieldChannel].Value())
+	m.inputs[fieldChannel].SetValue(channel)
+	if channel == "" {
+		m.err = "please enter a channel or user ID"
+		m.status = ""
+		return m, nil
+	}
+
+	audioFilePath := m.inputs[fieldAudio].Value()
+	if audioFilePath == "" {
+		m.err = "please enter an audio file path"
+		m.status = ""
+		return m, nil
+	}
+
+	x, err := strconv.Atoi(m.inputs[fieldTimes].Value())
+	if err != nil || x <= 0 {
+		m.err = "invalid number of times to send"
+		m.status = ""
+		return m, nil
+	}
+
+	// If DM mode is enabled, resolve the user ID to a DM channel ID.
+	if m.isDM {
+		m.status = "Creating DM channel..."
+		dmChannelID, err := CreateDMChannel(token, channel)
+		if err != nil {
+			m.err = fmt.Sprintf("could not create DM channel: %s", err)
+			m.status = ""
+			return m, nil
+		}
+		channel = dmChannelID
+	}
+
+	m.status = fmt.Sprintf("Sending %d voice message(s)...", x)
+	m.err = ""
+
+	for i := 0; i < x; i++ {
+		file, err := NewFile(audioFilePath)
+		if err != nil {
+			m.err = fmt.Sprintf("could not load audio file: %s", err)
+			m.status = ""
+			return m, nil
+		}
+
+		if _, err := file.CreateFile(token, channel); err != nil {
+			m.err = fmt.Sprintf("create attachment failed: %s", err)
+			m.status = ""
+			return m, nil
+		}
+
+		if err := file.PutFileData(); err != nil {
+			m.err = fmt.Sprintf("upload failed: %s", err)
+			m.status = ""
+			return m, nil
+		}
+
+		if err := file.SendFile(token, channel); err != nil {
+			m.err = fmt.Sprintf("send failed: %s", err)
+			m.status = ""
+			return m, nil
+		}
+	}
+
+	m.status = "Voice messages sent successfully!"
+	m.err = ""
+	return m, nil
+}
+
+func (m model) View() string {
+	b := "\n" + titleStyle.Render("Discord Voice Message") + "\n\n"
+
+	labels := []string{"Token", "Channel / User ID", "Audio File", "Times to Send"}
+	for i, input := range m.inputs {
+		label := labels[i]
+		if i == m.focus {
+			label = focusStyle.Render(label)
 		} else {
-			dialog.ShowInformation("Token Saved", "Token saved to file", w)
+			label = labelStyle.Render(label)
 		}
-	})
+		b += label + "\n" + input.View() + "\n\n"
+	}
 
-	tokenEntry.Text = string(token)
-	tokenEntry.Refresh()
+	dmCheck := checkboxOff
+	if m.isDM {
+		dmCheck = checkboxOn
+	}
+	b += dmCheck + " " + labelStyle.Render("Is DM") + "\n\n"
 
-	audioFileEntry := widget.NewEntry()
-	audioFileEntry.Disable()
-	audioFileEntry.SetPlaceHolder("Select audio file...")
+	b += hintStyle.Render("tab/shift+tab: move focus  •  enter: send  •  Ctrl+S: save token  •  Ctrl+D: toggle DM  •  Ctrl+R: clear status  •  Ctrl+C: quit") + "\n\n"
 
-	browseButton := widget.NewButton("Browse", func() {
-		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
-			if err == nil && reader != nil {
-				audioFileEntry.SetText(reader.URI().Path())
-			}
-		}, w)
+	if m.err != "" {
+		b += errorStyle.Render("Error: "+m.err) + "\n"
+	}
+	if m.status != "" {
+		b += statusStyle.Render("Status: " + m.status) + "\n"
+	}
 
-	})
+	return b
+}
 
-	timesEntry := widget.NewEntry()
-	timesEntry.SetPlaceHolder("Number of times to send")
-
-	sendButton := widget.NewButton("Send", func() {
-		// Get the channel ID
-		channel := channelEntry.Text
-
-		// Get the audio file path
-		audioFilePath := audioFileEntry.Text
-
-		// Get the number of times to send
-		x, err := strconv.Atoi(timesEntry.Text)
-		if err != nil {
-			dialog.ShowError(fmt.Errorf("invalid number of times"), w)
-			return
-		}
-
-		// show a loading dialog
-		loadingDialog := dialog.NewProgress("Processing Files", "Please wait...", w)
-		loadingDialog.Show()
-		defer loadingDialog.Hide()
-
-		totalFiles := float64(x)
-		progressStep := 1.0 / totalFiles
-		currentProgress := 0.0
-
-		for i := 0; i < x; i++ {
-			file, err := NewFile(audioFilePath)
-			if err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-
-			fmt.Printf("[Sending %d/%d] -> File Name: %s | File Type: %s | File Size: %d bytes\n", i+1, x, file.FileName, file.FileType, file.FileSize)
-
-			_, err = file.CreateFile(tokenEntry.Text, channel)
-			if err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-
-			err = file.PutFileData()
-			if err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-
-			err = file.SendFile(tokenEntry.Text, channel)
-			if err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-
-			fmt.Printf("[Sent %d/%d] -> File Name: %s | File Type: %s | File Size: %d bytes\n", i+1, x, file.FileName, file.FileType, file.FileSize)
-
-			// Update the progress bar
-			currentProgress += progressStep
-			log.Println(currentProgress)
-			loadingDialog.SetValue(currentProgress)
-			loadingDialog.Refresh()
-		}
-
-		dialog.ShowInformation("Sent", "Voice messages sent successfully!", w)
-	})
-
-	// Create a container for the widgets
-	mainVbox := container.NewVBox(container.NewAdaptiveGrid(2,
-		container.NewVBox(
-			widget.NewCard("Channel ID", "enter the channel id", channelEntry),
-			widget.NewCard("Token", "enter a a discord token", container.NewVBox(tokenEntry, saveTkn))),
-		container.NewVBox(
-			widget.NewCard("Audio File", "select your audio file", container.NewVBox(audioFileEntry, browseButton)),
-			widget.NewCard("Times to Send", "how many times do you want to send the file", timesEntry)),
-	),
-		sendButton)
-
-	w.SetContent(mainVbox)
-	w.ShowAndRun()
+func main() {
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error running program:", err)
+		os.Exit(1)
+	}
 }

@@ -47,6 +47,14 @@ type VoiceMessageAttachment struct {
 	Waveform         string  `json:"waveform"`
 }
 
+type DMChannelPayload struct {
+	RecipientID string `json:"recipient_id"`
+}
+
+type DMChannelResponse struct {
+	ID string `json:"id"`
+}
+
 var audioFileExtensions = []string{".mp3", ".wav", ".ogg", ".aac", ".flac"}
 
 var mimeDict = map[string]string{
@@ -102,6 +110,51 @@ func NewFile(path string) (*File, error) {
 	return &file, nil
 }
 
+// CreateDMChannel creates or returns an existing DM channel for the given user ID.
+// It returns the DM channel ID that can be used with the normal message endpoints.
+func CreateDMChannel(token, userID string) (string, error) {
+	url := "https://discord.com/api/v9/users/@me/channels"
+
+	payload := DMChannelPayload{
+		RecipientID: userID,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return "", errors.New("error marshalling json payload for create dm channel request")
+	}
+
+	headers := returnDiscordMobileCommonHeaders(token)
+
+	client := resty.New()
+
+	resp, err := client.R().
+		SetHeaders(headers).
+		SetBody(jsonPayload).
+		Post(url)
+
+	if err != nil {
+		return "", errors.New("error sending create dm channel request to discord api")
+	}
+
+	body := resp.Body()
+	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+		return "", fmt.Errorf("discord returned HTTP %d: %s", resp.StatusCode(), string(body))
+	}
+
+	var dmChannelResponse DMChannelResponse
+	err = json.Unmarshal(body, &dmChannelResponse)
+	if err != nil {
+		return "", fmt.Errorf("error unmarshalling create dm channel response: %w | body: %s", err, string(body))
+	}
+
+	if dmChannelResponse.ID == "" {
+		return "", fmt.Errorf("discord did not return a dm channel id; body: %s", string(body))
+	}
+
+	return dmChannelResponse.ID, nil
+}
+
 // CreateFile creates a new attachment in the specified channel, this is a blank attachment with no data
 // Use PutFileData to upload the file data to the attachment
 func (f *File) CreateFile(token, channel string) (CreateAttachmentResponse, error) {
@@ -123,8 +176,6 @@ func (f *File) CreateFile(token, channel string) (CreateAttachmentResponse, erro
 		return CreateAttachmentResponse{}, errors.New("error marshalling json payload for create attachment request")
 	}
 
-	fmt.Println(string(jsonPayload))
-
 	headers := returnDiscordMobileCommonHeaders(token)
 
 	client := resty.New()
@@ -138,10 +189,19 @@ func (f *File) CreateFile(token, channel string) (CreateAttachmentResponse, erro
 		return CreateAttachmentResponse{}, errors.New("error sending create attachment request to discord api")
 	}
 
+	body := resp.Body()
+	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+		return CreateAttachmentResponse{}, fmt.Errorf("discord returned HTTP %d: %s", resp.StatusCode(), string(body))
+	}
+
 	var createAttachmentResponse CreateAttachmentResponse
-	err = json.Unmarshal(resp.Body(), &createAttachmentResponse)
+	err = json.Unmarshal(body, &createAttachmentResponse)
 	if err != nil {
-		return CreateAttachmentResponse{}, errors.New("error unmarshalling create attachment response")
+		return CreateAttachmentResponse{}, fmt.Errorf("error unmarshalling create attachment response: %w | body: %s", err, string(body))
+	}
+
+	if len(createAttachmentResponse.Attachments) == 0 {
+		return CreateAttachmentResponse{}, fmt.Errorf("discord did not return any attachments; body: %s", string(body))
 	}
 
 	f.UploadUrl = createAttachmentResponse.Attachments[0].UploadUrl
@@ -243,15 +303,18 @@ func (f *File) SendFile(token, channel string) error {
 
 	client := resty.New()
 
-	_, err = client.R().
+	resp, err := client.R().
 		SetHeaders(headers).
 		SetBody(jsonPayload).
 		Post(url)
 
-	//fmt.Println(string(resp.Body()))
-
 	if err != nil {
 		return errors.New("error sending send file request to discord api")
+	}
+
+	body := resp.Body()
+	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+		return fmt.Errorf("discord returned HTTP %d: %s", resp.StatusCode(), string(body))
 	}
 
 	return nil
